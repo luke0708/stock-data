@@ -1,0 +1,8 @@
+pytdx>=1.72
+mootdx
+pandas>=2.0
+pyarrow>=14.0
+pyyaml
+akshare
+requests
+tqdm
