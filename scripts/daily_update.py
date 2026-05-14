@@ -86,14 +86,14 @@ def check_trade_day(meta: MetaDB, date_str: str, force: bool = False) -> bool:
     except Exception as e:
         logger.warning("akshare 日历查询失败（%s），使用工作日兜底", e)
 
+    # akshare 不可用时：工作日（周一到周五）直接假定为交易日
+    # 注意：节假日会被误判，但总比漏更新好；节假日当天 TDX ZIP 数据不会新增
     dt = datetime.strptime(date_str, "%Y%m%d")
     if dt.weekday() < 5:
-        last = meta.last_trade_day()
-        if last and abs((dt - datetime.strptime(last, "%Y%m%d")).days) <= 7:
-            logger.warning("akshare 不可用，%s 是工作日且日历连续，假定为交易日", date_str)
-            return True
+        logger.warning("akshare 不可用，%s 是工作日，假定为交易日（节假日不影响，ZIP数据无变化）", date_str)
+        return True
 
-    logger.info("%s 判断为非交易日，跳过（调试用：加 --force 强制运行）", date_str)
+    logger.info("%s 是周末，跳过更新", date_str)
     return False
 
 

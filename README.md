@@ -49,10 +49,17 @@ python3 scripts/daily_update.py
 
 内部自动：检查交易日 → 下载/复用缓存 ZIP → 更新 Parquet → 更新指数 → 更新日历
 
+### 手动补全历史数据（漏跑 N 天后）
+
+**TDX ZIP 始终是全量快照**，无论漏了几天，关代理运行一次即可补全所有缺失：
+
 ```bash
-# 补录指定日期（如漏跑）
-python3 scripts/daily_update.py --date 20260506
+python3 scripts/daily_update.py --force
 ```
+
+> `--force` 跳过交易日检查，强制执行，适合在任何时间点手动补录。
+
+不需要逐日指定，一次下载包含完整历史，所有缺失日期一次性补齐。
 
 ### 配置 Mac 定时任务（可选）
 
