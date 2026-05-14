@@ -28,7 +28,7 @@ db = StockDB()
 | `db.minutes()` | 1分钟线，写透缓存 | datetime, open, high, low, close, vol, amount |
 | `db.tick()` | 逐笔成交，当日实时或历史缓存 | time, price, vol, direction, amount |
 | `db.index()` | 指数日线（沪深300/上证50等） | date, open, high, low, close, vol, amount |
-| `db.stock_list()` | 股票列表（来自 SQLite） | code, name, market |
+| `db.stock_list()` | 股票列表（来自 SQLite） | code, name, market, board |
 | `db.financials()` | 财务摘要（akshare，季度） | 各财务指标列 |
 | `db.is_trade_day()` | 判断某天是否交易日 | bool |
 | `db.last_trade_day()` | 数据库最近交易日 | str `'YYYYMMDD'` |
@@ -161,15 +161,29 @@ sz_stocks = db.stock_list(market='sz')  # 深市（含创业板）
 bj_stocks = db.stock_list(market='bj')  # 北交所
 
 print(all_stocks.head())
-#      code  name market
-# 0  000001  平安银行     sz
-# 1  000002   万科A     sz
+#      code  name market  board
+# 0  000001  平安银行     sz    主板
+# 1  000002   万科A     sz    主板
+# 2  300661  圣邦股份     sz   创业板
+# 3  688981  中芯国际     sh   科创板
+```
+
+**按板块过滤（推荐用 `board` 字段）：**
+
+```python
+# board 取值：主板 / 科创板 / 创业板 / 中小板 / 北交所
+kcb   = all_stocks[all_stocks['board'] == '科创板']   # 科创板
+cyb   = all_stocks[all_stocks['board'] == '创业板']   # 创业板
+bse   = all_stocks[all_stocks['board'] == '北交所']   # 北交所
+main  = all_stocks[all_stocks['board'] == '主板']     # 主板
+
+print(f'科创板: {len(kcb)} 只，创业板: {len(cyb)} 只，北交所: {len(bse)} 只')
 ```
 
 **注意：** 当前列表包含 A 股、债券、ETF 等品种。过滤纯 A 股：
 
 ```python
-# 代码规律：主板 000/001/002/003/600/601/603/605/688，创业板 300/301
+# 通过代码规律过滤（更精准）
 a_shares = all_stocks[all_stocks['code'].str.match(r'^(000|001|002|003|300|301|600|601|603|605|688)\d{3}$')]
 ```
 

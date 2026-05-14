@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS stocks (
     code        TEXT PRIMARY KEY,
     name        TEXT,
     market      TEXT,        -- sh / sz / bj
+    board       TEXT,        -- 主板 / 科创板 / 创业板 / 中小板 / 北交所
     industry    TEXT,
     list_date   TEXT,
     delist_date TEXT,
@@ -70,13 +71,13 @@ class MetaDB:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         rows = [
             (s["code"], s.get("name", ""), s.get("market", ""),
-             s.get("industry", ""), s.get("list_date", ""),
-             s.get("delist_date", ""), now)
+             s.get("board", ""), s.get("industry", ""),
+             s.get("list_date", ""), s.get("delist_date", ""), now)
             for s in stocks
         ]
         with self._conn() as conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO stocks VALUES (?,?,?,?,?,?,?)", rows
+                "INSERT OR REPLACE INTO stocks VALUES (?,?,?,?,?,?,?,?)", rows
             )
         logger.info("Upserted %d stocks", len(rows))
 

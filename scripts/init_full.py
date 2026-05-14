@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from stockdb.config import Config
 from stockdb.db import MetaDB
-from stockdb.market import detect_market, market_to_tdx, INDEX_MAP
+from stockdb.market import detect_market, detect_board, market_to_tdx, INDEX_MAP
 from stockdb.tdx_client import tdx_connect, fetch_bars, fetch_security_list
 
 logging.basicConfig(
@@ -131,8 +131,46 @@ def process_zip(zip_bytes: bytes, market: str, data_dir: Path, cutoff_date: str)
 
 # ── 股票列表 ─────────────────────────────────────────
 
-def init_stock_list(cfg: Config, meta: MetaDB):
-    logger.info("Fetching stock list from pytdx ...")
+def _fetch_stock_list_akshare() -> list:
+    """用 akshare 拉取全市场股票列表（主源，数据更全、板块更准）"""
+    import akshare as ak
+    stocks = []
+
+    # 沪深主板 + 科创板 + 创业板（一次调用返回全部 A 股）
+    df = ak.stock_info_a_code_name()
+    for _, row in df.iterrows():
+        code = str(row["code"]).strip().zfill(6)
+        name = str(row.get("name", "")).strip()
+        market = "sh" if code.startswith(("6", "5", "688")) else "sz"
+        stocks.append({
+            "code":   code,
+            "name":   name,
+            "market": market,
+            "board":  detect_board(code),
+        })
+    logger.info("[akshare] %d stocks (SH+SZ+科创+创业)", len(stocks))
+
+    # 北交所单独拉
+    try:
+        bj_df = ak.stock_info_bj_name_code()
+        for _, row in bj_df.iterrows():
+            code = str(row.get("证券代码", row.get("code", ""))).strip().zfill(6)
+            name = str(row.get("证券简称", row.get("name", ""))).strip()
+            stocks.append({
+                "code":   code,
+                "name":   name,
+                "market": "bj",
+                "board":  detect_board(code, market="bj"),  # 传入 market 兜底
+            })
+        logger.info("[akshare] 北交所 %d stocks", len(bj_df))
+    except Exception as e:
+        logger.warning("北交所列表拉取失败: %s", e)
+
+    return stocks
+
+
+def _fetch_stock_list_pytdx(cfg: Config) -> list:
+    """pytdx 兜底方式（部分服务器 get_security_list 可能返回空）"""
     stocks = []
     with tdx_connect(cfg.servers) as api:
         for market_int, market_str in [(1, "sh"), (0, "sz")]:
@@ -143,8 +181,33 @@ def init_stock_list(cfg: Config, meta: MetaDB):
                     "code":   code,
                     "name":   s.get("name", ""),
                     "market": market_str,
+                    "board":  detect_board(code),
                 })
-            logger.info("[%s] %d stocks", market_str, len(raw))
+            logger.info("[pytdx/%s] %d stocks", market_str, len(raw))
+    return stocks
+
+
+def init_stock_list(cfg: Config, meta: MetaDB):
+    """优先用 akshare 拉股票列表，失败时用 pytdx 兜底"""
+    stocks = []
+
+    try:
+        logger.info("Fetching stock list from akshare ...")
+        stocks = _fetch_stock_list_akshare()
+    except Exception as e:
+        logger.warning("akshare 股票列表失败: %s，切换到 pytdx ...", e)
+
+    # akshare 失败或返回数量异常时用 pytdx
+    if len(stocks) < 100:
+        logger.info("Fetching stock list from pytdx (fallback) ...")
+        try:
+            stocks = _fetch_stock_list_pytdx(cfg)
+        except Exception as e:
+            logger.error("pytdx 股票列表也失败: %s", e)
+
+    if not stocks:
+        logger.error("股票列表获取失败，跳过写入")
+        return
 
     meta.upsert_stocks(stocks)
     logger.info("Stock list: %d total", len(stocks))
