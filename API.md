@@ -30,6 +30,7 @@ db = StockDB()
 | `db.index()` | 指数日线（沪深300/上证50等） | date, open, high, low, close, vol, amount |
 | `db.stock_list()` | 股票列表（来自 SQLite） | code, name, market, board |
 | `db.financials()` | 财务摘要（akshare，季度） | 各财务指标列 |
+| `db.chip()` | 筹码分布（本地计算，按需缓存） | date, close, profit_ratio, concentration_90, concentration_70, avg_cost, peak_price |
 | `db.is_trade_day()` | 判断某天是否交易日 | bool |
 | `db.last_trade_day()` | 数据库最近交易日 | str `'YYYYMMDD'` |
 
@@ -189,6 +190,67 @@ a_shares = all_stocks[all_stocks['code'].str.match(r'^(000|001|002|003|300|301|6
 
 ---
 
+## 筹码分布 `db.chip()`
+
+> 从本地 OHLCV 日线数据离线计算，**无需网络**。首次调用临时计算（约 0.02s），结果自动缓存到 `data/chip/{code}.parquet`，后续调用毫秒级。
+
+```python
+# 获取全部历史筹码分布
+df = db.chip('300661')
+print(df.tail())
+#         date   close  profit_ratio  concentration_90  concentration_70  avg_cost  peak_price
+# 498 2026-05-14  108.5        0.3821            0.0412            0.0287    105.32      106.80
+# 499 2026-05-15  107.2        0.2954            0.0389            0.0261    104.87      106.80
+
+# 获取指定日期（策略信号常用）
+row = db.chip('300661', date='2026-05-15')
+profit  = row['profit_ratio'].iloc[0]       # 0.30 = 30% 筹码处于获利
+conc90  = row['concentration_90'].iloc[0]   # 筹码集中度，越小越集中
+conc70  = row['concentration_70'].iloc[0]
+avg_cost = row['avg_cost'].iloc[0]          # 主力平均成本
+peak    = row['peak_price'].iloc[0]         # 筹码密集峰值价
+
+# 强制重算（日线更新后刷新缓存）
+db.chip('300661', recalc=True)
+```
+
+**返回列说明：**
+
+| 列名 | 含义 | 取值范围 |
+|---|---|---|
+| `profit_ratio` | 获利比例：当前价以下筹码占比 | 0~1，越高套牢盘越少 |
+| `concentration_90` | 90% 筹码价格区间宽度 / 当前价 | 越小越集中，筹码越稳定 |
+| `concentration_70` | 70% 筹码价格区间宽度 / 当前价 | 同上，更敏感 |
+| `avg_cost` | 主力加权平均成本 | 单位：元 |
+| `peak_price` | 筹码密集度最高的价格（众数） | 单位：元 |
+
+**批量获取多只股票当天筹码：**
+
+```python
+codes = ['600000', '600519', '000001', '300661']
+today = '2026-05-15'
+
+result = []
+for c in codes:
+    row = db.chip(c, date=today)
+    if not row.empty:
+        result.append({'code': c, **row.iloc[0].to_dict()})
+
+import pandas as pd
+print(pd.DataFrame(result))
+```
+
+**算法说明：**
+
+- 核心模型：**三角分布递推**（行业标准 OHLCV 筹码算法）
+- 每根 K 线的成交量在 `[low, high]` 区间按三角分布分配，峰值在收盘价
+- 换手率用相对成交量代理（无需流通股本），获利比例与东方财富误差约 ±5~10%，方向一致
+- 追溯最近 500 个交易日（约 2 年），更早历史对当前筹码贡献极小
+
+**缓存路径：** `data/chip/{code}.parquet`
+
+---
+
 ## 工具方法
 
 ```python
@@ -261,6 +323,7 @@ def get_tick_flow(code: str, date: str = None):
 | Tick | 按需 | 首次调用自动拉取，保留7天 |
 | 指数 | 每个交易日 | `daily_update.py` 自动更新 |
 | 股票列表 | 手动 | `python3 scripts/init_full.py` |
+| 筹码分布 | 按需（自动缓存） | `db.chip(code)` 首次自动算并缓存；日更后用 `recalc=True` 刷新 |
 
 ---
 

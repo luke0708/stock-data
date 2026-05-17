@@ -384,3 +384,65 @@ class StockDB:
                 count += 1
         if count:
             logger.info("Cleaned %d old tick files (before %s)", count, cutoff)
+
+    # ── 筹码分布 ──────────────────────────────────────
+
+    def chip(
+        self,
+        code: str,
+        date: Optional[str] = None,
+        recalc: bool = False,
+    ) -> pd.DataFrame:
+        """
+        筹码分布指标（本地计算，缓存到 data/chip/{code}.parquet）。
+
+        算法：三角分布递推模型，从已有 OHLCV 日线数据离线计算，无需网络。
+
+        Args:
+            code    : 股票代码，6 位数字（如 '300661'）
+            date    : 'YYYY-MM-DD' 或 'YYYYMMDD'；None 返回全部历史
+            recalc  : True 时强制重算（忽略缓存），用于日更后刷新
+
+        Returns:
+            DataFrame，列：
+                date, close, profit_ratio, concentration_90,
+                concentration_70, avg_cost, peak_price
+
+            profit_ratio      获利比例（0~1，越高说明套牢盘越少）
+            concentration_90  90% 筹码价格区间 / 当前价（越小越集中）
+            concentration_70  70% 筹码价格区间 / 当前价
+            avg_cost          主力成本（加权均价）
+            peak_price        筹码密集峰值价格
+
+        示例：
+            df  = db.chip('300661')                     # 全部历史
+            row = db.chip('300661', date='2026-05-16')  # 指定日期
+            db.chip('300661', recalc=True)              # 强制重算
+        """
+        from .chip import compute_chip_distribution
+
+        code = normalize_code(code)
+        cache_path = self.cfg.data_dir / "chip" / f"{code}.parquet"
+
+        if not recalc and cache_path.exists():
+            result = pd.read_parquet(cache_path)
+        else:
+            daily_df = self.daily(code)
+            if daily_df.empty:
+                logger.warning("chip: no daily data for %s", code)
+                return pd.DataFrame()
+            result = compute_chip_distribution(daily_df)
+            if not result.empty:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                result.to_parquet(cache_path, index=False)
+                logger.debug("chip cached: %s (%d rows)", code, len(result))
+
+        if result.empty:
+            return result
+
+        # 日期过滤
+        if date:
+            target = pd.to_datetime(date)
+            result = result[result["date"] == target]
+
+        return result.reset_index(drop=True)

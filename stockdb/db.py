@@ -109,10 +109,13 @@ class MetaDB:
         return bool(row and row["is_open"])
 
     def last_trade_day(self) -> Optional[str]:
-        """返回数据库中最近的交易日"""
+        """返回数据库中最近的交易日（不超过今天，避免日历预存未来日期干扰）"""
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT date FROM trade_calendar WHERE is_open=1 ORDER BY date DESC LIMIT 1"
+                "SELECT date FROM trade_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT 1",
+                (today,)
             ).fetchone()
         return row["date"] if row else None
 
