@@ -101,7 +101,8 @@ class MetaDB:
             )
 
     def is_trade_day(self, date_str: str) -> bool:
-        """判断某天是否为交易日"""
+        """判断某天是否为交易日，兼容 'YYYYMMDD' 和 'YYYY-MM-DD' 两种格式"""
+        date_str = str(date_str).replace("-", "")  # 标准化：去採 → YYYYMMDD
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT is_open FROM trade_calendar WHERE date=?", (date_str,)
@@ -109,13 +110,21 @@ class MetaDB:
         return bool(row and row["is_open"])
 
     def last_trade_day(self) -> Optional[str]:
-        """返回数据库中最近的交易日（不超过今天，避免日历预存未来日期干扰）"""
+        """返回日历中最近的交易日（不超过今天，避免日历预存未来日期干扰）"""
         from datetime import datetime
         today = datetime.now().strftime("%Y%m%d")
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT date FROM trade_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT 1",
                 (today,)
+            ).fetchone()
+        return row["date"] if row else None
+
+    def last_updated_day(self) -> Optional[str]:
+        """返回 update_log 中最近一次状态为 ok 的更新日期（即本地实际数据最新日期）"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT date FROM update_log WHERE status='ok' ORDER BY date DESC LIMIT 1"
             ).fetchone()
         return row["date"] if row else None
 

@@ -42,7 +42,8 @@ python3 scripts/init_full.py
 ### 每日更新 / 周末补数
 
 ```bash
-python3 scripts/daily_update.py
+source .venv/bin/activate && python3 scripts/daily_update.py
+#python3 scripts/daily_update.py
 ```
 
 - 工作日运行：补当天数据

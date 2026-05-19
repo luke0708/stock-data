@@ -39,6 +39,12 @@ def _bars_to_df(data: list, freq: str = "daily") -> pd.DataFrame:
         cols = ["date", "open", "high", "low", "close", "vol", "amount"]
         df = df[[c for c in cols if c in df.columns]].copy()
         df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset=["date"])
+        # 年份合法性校验：过滤採用错误 API 导致的乱码行（1990~2100）
+        valid_years = (df["date"].dt.year >= 1990) & (df["date"].dt.year <= 2100)
+        dropped = (~valid_years).sum()
+        if dropped:
+            logger.warning("_bars_to_df: 过滤 %d 行非法日期（年份超出 1990~2100），请检查指数拉取 API", dropped)
+        df = df[valid_years]
     else:  # minute
         df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
         cols = ["datetime", "open", "high", "low", "close", "vol", "amount"]
@@ -242,11 +248,21 @@ class StockDB:
 
         if path.exists():
             df = pd.read_parquet(path)
+            # 合法性公卡：旧缓存可能用错误 API 写入了乱码数据
+            if "date" in df.columns and not df.empty:
+                valid = (df["date"].dt.year >= 1990) & (df["date"].dt.year <= 2100)
+                if not valid.all():
+                    logger.warning("指数 %s 缓存包含乱码数据，自动重新拉取...", code)
+                    path.unlink()  # 删除却废文件
+                    df = pd.DataFrame()
         else:
+            df = pd.DataFrame()
+
+        if df.empty:
             logger.info("index cache miss %s, fetching...", code)
             market_str = INDEX_MAP.get(code, ("sh",))[0]
             market_int = 1 if market_str == "sh" else 0
-            df = self._fetch_daily_raw(code, market_int)
+            df = self._fetch_index_raw(code, market_int)
             if not df.empty:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 df.to_parquet(path, index=False)
@@ -294,6 +310,27 @@ class StockDB:
         except Exception as e:
             logger.error("fetch daily failed %s: %s", code, e)
             return self._fallback_daily(code)
+
+    def _fetch_index_raw(self, code: str, market: int) -> pd.DataFrame:
+        """
+        拉取指数日线，使用 get_index_bars() API。
+        注意：指数不能用 get_security_bars()，其二进制协议格式不同，会导致日期和价格字段乱码。
+        """
+        try:
+            with tdx_connect(self.cfg.servers) as api:
+                all_data, start = [], 0
+                while True:
+                    batch = api.get_index_bars(9, market, code, start, 800)
+                    if not batch:
+                        break
+                    all_data.extend(batch)
+                    if len(batch) < 800:
+                        break
+                    start += 800
+            return _bars_to_df(all_data, freq="daily")
+        except Exception as e:
+            logger.error("fetch index failed %s: %s", code, e)
+            return pd.DataFrame()
 
     def _fetch_minutes(self, code: str, date_str: str) -> pd.DataFrame:
         market = code_to_tdx_market(code)
@@ -426,7 +463,26 @@ class StockDB:
 
         if not recalc and cache_path.exists():
             result = pd.read_parquet(cache_path)
+            # 自动检测缓存是否落后于 daily 数据
+            if not result.empty:
+                daily_path = self.cfg.daily_path(code)
+                if daily_path.exists():
+                    try:
+                        import pyarrow.parquet as pq
+                        pf = pq.read_table(str(daily_path), columns=["date"])
+                        if pf.num_rows > 0:
+                            latest_daily = pd.to_datetime(pf.column("date")[-1].as_py())
+                            latest_chip = pd.to_datetime(result["date"].max())
+                            if latest_daily > latest_chip:
+                                logger.debug("chip cache stale for %s (%s < %s), recalculating...",
+                                             code, latest_chip.date(), latest_daily.date())
+                                recalc = True
+                    except Exception:
+                        pass
         else:
+            result = pd.DataFrame()
+
+        if recalc or result.empty:
             daily_df = self.daily(code)
             if daily_df.empty:
                 logger.warning("chip: no daily data for %s", code)
