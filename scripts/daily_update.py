@@ -19,8 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from stockdb.config import Config
 from stockdb.db import MetaDB
-from stockdb.market import INDEX_MAP
-from stockdb.reader import _bars_to_df, _append_parquet, StockDB
+from stockdb.market import INDEX_MAP, code_to_tdx_market
+from stockdb.reader import _bars_to_df, _append_parquet, StockDB, fetch_minutes_from_web, disable_proxy
 from stockdb.tdx_client import tdx_connect
 
 # ── 日志 ─────────────────────────────────────────────
@@ -41,9 +41,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("daily_update")
 
-# A 股代码范围（排除债券、ETF、转债等）
+# A 股代码范围（含主板、科创、创业板以及北交所代码如 43/83/87 开头，排除债券、ETF、转债等）
 A_SHARE_RE = re.compile(
-    r'^(000|001|002|003|300|301|600|601|603|605|688)\d{3}$'
+    r'^(000|001|002|003|300|301|600|601|603|605|688|43\d|83\d|87\d)\d{3}$'
 )
 
 # 超过此天数提示使用 init_full.py（pytdx 最多返回约 800 根日线）
@@ -52,14 +52,36 @@ MAX_INCREMENTAL_DAYS = 60
 
 # ── 交易日判断 ────────────────────────────────────────
 
-def resolve_target_date() -> str:
+def resolve_target_date(meta: MetaDB) -> str:
     """
     确定本次更新的目标交易日：
-      - 工作日 → 今天
-      - 周六/周日 → 自动回溯到最近周五
+      - 如果当前时间在 15:30 之后，目标日期上限为今天。
+      - 如果当前时间在 15:30 之前，目标日期上限为昨天。
+      - 然后在 trade_calendar 中寻找不大于该上限的最近一个交易日，防止盘中数据污染。
     """
+    from datetime import time as dtime
     now = datetime.now()
-    target = now
+    
+    # 确定查询上限日期
+    if now.time() >= dtime(15, 30):
+        limit_date = now.strftime("%Y%m%d")
+    else:
+        limit_date = (now - timedelta(days=1)).strftime("%Y%m%d")
+        
+    # 从元数据库交易日历寻找最近的已开市交易日
+    try:
+        with meta._conn() as conn:
+            row = conn.execute(
+                "SELECT date FROM trade_calendar WHERE is_open=1 AND date <= ? ORDER BY date DESC LIMIT 1",
+                (limit_date,)
+            ).fetchone()
+        if row:
+            return row["date"]
+    except Exception as e:
+        logger.warning("Query trade calendar failed: %s", e)
+        
+    # 兜底回溯逻辑（若日历表未初始化或空）
+    target = now if now.time() >= dtime(15, 30) else now - timedelta(days=1)
     if target.weekday() == 5:   # 周六
         target = target - timedelta(days=1)
     elif target.weekday() == 6: # 周日
@@ -117,13 +139,14 @@ def _fetch_akshare_day(code: str, start_date: str, end_date: str) -> pd.DataFram
     """
     try:
         import akshare as ak
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="",          # 不复权，与 pytdx 保持一致
-        )
+        with disable_proxy():
+            df = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="",          # 不复权，与 pytdx 保持一致
+            )
         if df is None or df.empty:
             return pd.DataFrame()
         col_map = {
@@ -198,7 +221,8 @@ def _bulk_update_from_spot(cfg: Config, date_str: str) -> int:
 
     logger.info("📡 快速通道：akshare 全市场快照（单次 HTTP 请求）...")
     try:
-        raw = ak.stock_zh_a_spot_em()
+        with disable_proxy():
+            raw = ak.stock_zh_a_spot_em()
     except Exception as e:
         logger.warning("akshare 快照失败: %s，降级到 pytdx", e)
         return -1
@@ -220,7 +244,13 @@ def _bulk_update_from_spot(cfg: Config, date_str: str) -> int:
     # 过滤：只保留 A 股正常交易（成交量 > 0）
     raw = raw[raw["code"].str.match(A_SHARE_RE)]
     if "vol" in raw.columns:
-        raw = raw[pd.to_numeric(raw["vol"], errors="coerce").fillna(0) > 0]
+        raw["vol"] = pd.to_numeric(raw["vol"], errors="coerce").fillna(0)
+        raw = raw[raw["vol"] > 0]
+        # 北交所股票代码以 43/83/87 开头，其成交量单位已经是股，其余个股成交量为手，需乘以 100 对齐
+        raw["vol"] = raw.apply(
+            lambda r: r["vol"] if r["code"].startswith(("43", "83", "87")) else r["vol"] * 100,
+            axis=1
+        )
 
     valid_cols = [c for c in ["date", "open", "high", "low", "close", "vol", "amount"]
                   if c in raw.columns]
@@ -274,6 +304,20 @@ def incremental_update(cfg: Config, date_str: str, n_bars: int) -> int:
             return n
         logger.info("快速通道失败，降级到 pytdx 逐只模式...")
 
+    meta = MetaDB(cfg.db_path)
+    
+    # ── 获取已退市代码列表，防止无效网络同步 ──
+    delisted_codes = set()
+    try:
+        with meta._conn() as conn:
+            rows = conn.execute(
+                "SELECT code FROM stocks WHERE delist_date IS NOT NULL AND delist_date != '' AND delist_date <= ?",
+                (date_str,)
+            ).fetchall()
+            delisted_codes = {r["code"] for r in rows}
+    except Exception as e:
+        logger.warning("Failed to query delisted stocks: %s", e)
+
     cutoff = f"{datetime.now().year - cfg.history_years}0101"
     total = 0
 
@@ -295,13 +339,15 @@ def incremental_update(cfg: Config, date_str: str, n_bars: int) -> int:
         logger.info("[%s] 并发更新 %d 只 A 股（%d workers，最近 %d 条）...",
                     market_str.upper(), len(a_files), CONCURRENT_WORKERS, n_bars)
 
-        # ── 预过滤：本地已有目标日期的直接跳过 ──────────
-        need_update = [f for f in a_files
-                       if not f.exists() or _peek_last_date(f) < date_str]
+        # ── 预过滤：本地已有目标日期或属于已退市股票的直接跳过 ──────────
+        need_update = [
+            f for f in a_files
+            if (not f.exists() or _peek_last_date(f) < date_str) and f.stem not in delisted_codes
+        ]
         already_done = len(a_files) - len(need_update)
         if already_done:
-            logger.info("[%s] 跳过 %d 只（已有 %s 数据），实际拉取 %d 只",
-                        market_str.upper(), already_done, date_str, len(need_update))
+            logger.info("[%s] 跳过 %d 只（已有数据或已退市），实际拉取 %d 只",
+                        market_str.upper(), already_done, len(need_update))
         if not need_update:
             logger.info("[%s] 全部已是最新，跳过", market_str.upper())
             continue
@@ -393,6 +439,161 @@ def update_indices(cfg: Config, date_str: str):
             logger.warning("Index %s failed: %s", code, e)
 
 
+# ── 分钟线主动沉淀与增量沉淀 ─────────────────────────
+
+def get_watchlist_and_cached_codes(cfg: Config) -> set:
+    codes = set(cfg.watchlist)
+    minutes_dir = cfg.data_dir / "minutes"
+    if minutes_dir.exists():
+        for m in ("sh", "sz", "bj"):
+            m_dir = minutes_dir / m
+            if m_dir.exists():
+                for f in m_dir.iterdir():
+                    if f.is_dir() and A_SHARE_RE.match(f.name):
+                        codes.add(f.name)
+    return codes
+
+
+def get_last_minutes_date(cfg: Config, code: str) -> str:
+    from stockdb.market import detect_market
+    market = detect_market(code)
+    code_dir = cfg.data_dir / "minutes" / market / code
+    if not code_dir.exists():
+        return ""
+    parquet_files = sorted(code_dir.glob("*.parquet"))
+    if not parquet_files:
+        return ""
+    return parquet_files[-1].stem  # 返回 YYYYMMDD
+
+
+def update_minutes(cfg: Config, date_str: str, meta: MetaDB):
+    """
+    主动更新分钟线（Watchlist + 已缓存股），防止 100 天断档风险。
+    """
+    logger.info("=" * 50)
+    logger.info("📡 开始增量补齐 1 分钟线 data...")
+    logger.info("=" * 50)
+
+    # 1. 查找需要更新的所有股票
+    codes = get_watchlist_and_cached_codes(cfg)
+    if not codes:
+        logger.info("没有需要更新分钟线的股票，跳过。")
+        return
+
+    logger.info("共找到 %d 只股票需要更新分钟线...", len(codes))
+
+    # 判断当前时间是否允许写入今日（date_str）的分钟线 Parquet
+    # 分钟线强收盘线定位在 15:10
+    today_str = datetime.now().strftime("%Y%m%d")
+    allow_today_write = True
+    if date_str == today_str and datetime.now().time() < datetime.strptime("15:10", "%H:%M").time():
+        allow_today_write = False
+        logger.info("当前时间未到 15:10，今日分钟数据不完整，今日 Parquet 将不予写入。")
+
+    updated_count = 0
+
+    # 获取已退市代码
+    delisted_codes = set()
+    try:
+        with meta._conn() as conn:
+            rows = conn.execute(
+                "SELECT code FROM stocks WHERE delist_date IS NOT NULL AND delist_date != '' AND delist_date <= ?",
+                (date_str,)
+            ).fetchall()
+            delisted_codes = {r["code"] for r in rows}
+    except Exception as e:
+        logger.warning("Query delisted stocks failed in update_minutes: %s", e)
+
+    def _update_one_minute(code: str) -> bool:
+        try:
+            if code in delisted_codes:
+                logger.info("股票 [%s] 已退市，跳过分钟线更新。", code)
+                return False
+
+            # 检查本地最后更新日期
+            last_date = get_last_minutes_date(cfg, code)
+            
+            # 如果本地已经是最新的，无需拉取
+            if last_date and last_date >= date_str:
+                return False
+                
+            # 检查本地日线的最新日期
+            daily_path = cfg.daily_path(code)
+            last_daily_date = _peek_last_date(daily_path)
+            
+            # 如果已同步到日线最新进度，跳过（停牌无新交易）
+            if last_date and last_daily_date and last_date >= last_daily_date:
+                return False
+            
+            # 计算缺失天数
+            missing_days = 999
+            if last_date:
+                missing_days = (
+                    datetime.strptime(date_str, "%Y%m%d") -
+                    datetime.strptime(last_date, "%Y%m%d")
+                ).days
+                
+            # 断档检测报警：只有当本地日线领先于分钟线才报警
+            if last_daily_date and last_date and last_daily_date > last_date:
+                if missing_days >= 100:
+                    logger.critical("⚠️  股票 [%s] 分钟线已超过 100 天未更新（上次: %s），存在数据断档！", code, last_date)
+                elif missing_days >= 90:
+                    logger.warning("⚠️  股票 [%s] 分钟线已连续 %d 天未更新，请及时补齐！", code, missing_days)
+                
+            df_new = pd.DataFrame()
+            
+            # 1. 缺失少于等于 5 天，走极速 HTTP 趋势
+            if missing_days <= 5:
+                df_new = fetch_minutes_from_web(code, ndays=5)
+            
+            # 2. trends 失败，或者缺失天数大于 5 天，走 pytdx 批量拉取
+            if df_new.empty:
+                try:
+                    db_inst = StockDB()
+                    market = code_to_tdx_market(code)
+                    with tdx_connect(db_inst.cfg.servers) as api:
+                        from stockdb.tdx_client import fetch_bars
+                        data = fetch_bars(api, code, market, frequency=8)
+                    df_new = _bars_to_df(data, freq="minute")
+                except Exception as ex:
+                    logger.debug("Tdx minutes pull failed for %s: %s", code, ex)
+            
+            # 3. 网页直连接口兜底
+            if df_new.empty:
+                df_new = fetch_minutes_from_web(code, ndays=5)
+
+            if df_new.empty:
+                return False
+                
+            # 分组写盘
+            df_new["_date"] = df_new["datetime"].dt.strftime("%Y%m%d")
+            grouped = df_new.groupby("_date")
+            cached_days = 0
+            for day_str, day_df in grouped:
+                if day_str == today_str and not allow_today_write:
+                    continue
+                
+                day_df = day_df.drop(columns=["_date"]).reset_index(drop=True)
+                path = cfg.minutes_path(code, day_str)
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    day_df.to_parquet(path, index=False)
+                    cached_days += 1
+            return cached_days > 0
+        except Exception as err:
+            logger.error("更新股票 [%s] 分钟线时发生异常: %s", code, err)
+            return False
+
+    # 串行同步轮询，防范多线程 V8 内存冲突
+    results = []
+    for code in sorted(codes):
+        results.append(_update_one_minute(code))
+        
+    updated_count = sum(results)
+    logger.info("分钟线更新完成！共更新 %d 只股票的分钟数据。", updated_count)
+    logger.info("=" * 50)
+
+
 # ── 主程序 ───────────────────────────────────────────
 
 def main():
@@ -400,7 +601,7 @@ def main():
     meta = MetaDB(cfg.db_path)
 
     # 1. 确定目标日期（周末自动回溯）
-    date_str = resolve_target_date()
+    date_str = resolve_target_date(meta)
 
     logger.info("=" * 50)
     logger.info("stockdb 每日更新 — %s", date_str)
@@ -411,7 +612,7 @@ def main():
         logger.info("%s 非交易日，无需更新", date_str)
         return
 
-    # 3. 判断缺失天数（用 update_log 的实际数据日期，而非 trade_calendar 日历日期）
+    # 3. 判断缺失天数
     last = meta.last_updated_day()
     if last:
         missing_days = (
@@ -429,30 +630,48 @@ def main():
         logger.error("   请运行全量初始化：python3 scripts/init_full.py")
         sys.exit(1)
 
-    if missing_days <= 0:
-        logger.info("✅ %s 数据已是最新，无需更新", date_str)
-        return
+    # 4. 日线更新控制流
+    if missing_days > 0:
+        logger.info("距上次更新 %d 天，开始增量补齐日线数据...", missing_days)
+        # pytdx 增量拉取（n_bars 留一定余量，最少 5 条）
+        n_bars = max(5, min(missing_days * 2 + 5, 50))
+        n = incremental_update(cfg, date_str, n_bars)
 
-    logger.info("距上次更新 %d 天，开始增量补齐...", missing_days)
+        if n == 0:
+            logger.error("❌ pytdx 增量更新失败（无数据返回）")
+            logger.error("   请检查网络连接，或运行：python3 scripts/init_full.py")
+            sys.exit(1)
 
-    # 4. pytdx 增量拉取（n_bars 留一定余量，最少 5 条）
-    n_bars = max(5, min(missing_days * 2 + 5, 50))
-    n = incremental_update(cfg, date_str, n_bars)
+        # 5. 指数 + 日历
+        update_indices(cfg, date_str)
+        meta.upsert_calendar([date_str], is_open=1)
+        meta.log_update(date_str, "ok", f"增量更新 {n} 只")
+        logger.info("=" * 50)
+        logger.info("✅ 日线更新完成！共补齐 %d 只 A 股数据", n)
+        logger.info("=" * 50)
+    else:
+        logger.info("✅ %s 日线数据已是最新，无需更新。", date_str)
 
-    if n == 0:
-        logger.error("❌ pytdx 增量更新失败（无数据返回）")
-        logger.error("   请检查网络连接，或运行：python3 scripts/init_full.py")
-        sys.exit(1)
+    # 5. 分钟线增量沉淀
+    try:
+        update_minutes(cfg, date_str, meta)
+    except Exception as e:
+        logger.warning("分钟线增量沉淀失败: %s", e)
 
-    # 5. 指数 + 日历
-    update_indices(cfg, date_str)
-    meta.upsert_calendar([date_str], is_open=1)
-    StockDB().clean_old_ticks()
+    # 6. Tick 清理
+    try:
+        db = StockDB()
+        db.clean_old_ticks()
+    except Exception as e:
+        logger.warning("清理旧 Tick 缓存失败: %s", e)
 
-    meta.log_update(date_str, "ok", f"增量更新 {n} 只")
-    logger.info("=" * 50)
-    logger.info("✅ 更新完成！共补齐 %d 只 A 股数据", n)
-    logger.info("=" * 50)
+    # 7. 股票流通股本更新
+    try:
+        logger.info("📡 开始同步股票流通股本...")
+        db = StockDB()
+        db.update_stock_shares()
+    except Exception as e:
+        logger.warning("同步股票流通股本失败: %s", e)
 
 
 if __name__ == "__main__":

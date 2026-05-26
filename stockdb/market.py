@@ -15,7 +15,7 @@ def detect_market(code: str) -> str:
     code = str(code).strip().zfill(6)
     if code.startswith(("6", "5", "11", "51", "58")):
         return "sh"
-    elif code.startswith(("4", "8", "87", "88", "43", "83")):
+    elif code.startswith(("4", "8", "87", "88", "43", "83", "92")):
         return "bj"
     else:
         return "sz"

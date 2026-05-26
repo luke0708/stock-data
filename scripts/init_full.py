@@ -300,6 +300,12 @@ def main():
     # Step 2: 股票列表
     try:
         init_stock_list(cfg, meta)
+        try:
+            from scripts.update_industries import update_industries
+            logger.info("Initializing stock industries from Sina...")
+            update_industries()
+        except Exception as e:
+            logger.error("Stock industries init failed: %s", e)
     except Exception as e:
         logger.error("Stock list init failed: %s", e)
 
@@ -314,6 +320,15 @@ def main():
         init_indices(cfg)
     except Exception as e:
         logger.error("Index init failed: %s", e)
+
+    # Step 5: 股票流通股本
+    try:
+        from stockdb import StockDB
+        db = StockDB()
+        logger.info("Syncing stock shares outstanding...")
+        db.update_stock_shares()
+    except Exception as e:
+        logger.error("Stock shares sync failed: %s", e)
 
     logger.info("=" * 60)
     logger.info("✅ 初始化完成！运行 daily_update.py 可补充今日数据。")

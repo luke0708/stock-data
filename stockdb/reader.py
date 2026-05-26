@@ -87,7 +87,7 @@ def _append_parquet(path: Path, new_df: pd.DataFrame, dedup_col: str):
         df = pd.concat([old_df, new_df], ignore_index=True)
     else:
         df = new_df
-    df = df.drop_duplicates(subset=[dedup_col]).sort_values(dedup_col)
+    df = df.drop_duplicates(subset=[dedup_col], keep="last").sort_values(dedup_col)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
 
@@ -118,22 +118,23 @@ class StockDB:
         code: str,
         start: Optional[str] = None,
         end: Optional[str] = None,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
         """
         读日线 OHLCV。全市场可用，本地 Parquet 优先。
-        首次调用若本地无数据，从 pytdx 拉取并存盘。
+        首次调用若本地无数据，或 force_refresh=True 时，从 pytdx 拉取并存盘。
         """
         code = normalize_code(code)
         path = self.cfg.daily_path(code)
 
-        if path.exists():
+        if path.exists() and not force_refresh:
             df = pd.read_parquet(path)
         else:
-            logger.info("daily cache miss %s, fetching from pytdx...", code)
+            logger.info("daily cache miss or forced refresh %s, fetching from pytdx...", code)
             df = self._fetch_daily(code)
             if not df.empty:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(path, index=False)
+                _append_parquet(path, df, dedup_col="date")
+                df = pd.read_parquet(path)
 
         # 日期过滤
         if "date" in df.columns:
@@ -284,6 +285,122 @@ class StockDB:
         market: 'sh' / 'sz' / 'bj' / None（全部）
         """
         return self._meta.get_stocks(market)
+
+    def get_shares(self, code: str) -> dict:
+        """
+        获取单只股票的最新流通股本与自由流通股本。
+        返回 dict: {"outstanding_shares": float or None, "free_float_shares": float or None}
+        """
+        code = normalize_code(code)
+        with self._meta._conn() as conn:
+            row = conn.execute(
+                "SELECT outstanding_shares, free_float_shares FROM stocks WHERE code = ?",
+                (code,)
+            ).fetchone()
+            
+        if row:
+            return {
+                "outstanding_shares": row["outstanding_shares"],
+                "free_float_shares": row["free_float_shares"]
+            }
+        return {
+            "outstanding_shares": None,
+            "free_float_shares": None
+        }
+
+    def update_stock_shares(self, max_workers: int = 20):
+        """
+        从 pytdx 批量拉取全市场股票的流通股本，并更新到本地 SQLite 元数据库中。
+        使用多线程与连接复用机制提高效率。
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from pytdx.hq import TdxHq_API
+
+        df_stocks = self.stock_list()
+        if df_stocks.empty:
+            logger.warning("No stocks found in database, skip updating shares.")
+            return
+
+        logger.info("Starting update of stock shares for %d stocks...", len(df_stocks))
+        start_time = time.time()
+
+        # 分包划分
+        codes = df_stocks["code"].tolist()
+        chunk_size = (len(codes) + max_workers - 1) // max_workers
+        chunks = [codes[i : i + chunk_size] for i in range(0, len(codes), chunk_size)]
+
+        def fetch_shares_chunk_worker(chunk_codes):
+            chunk_results = {}
+            api = None
+            i = 0
+            retry_count = 0
+            max_retries_per_code = 2
+            
+            while i < len(chunk_codes):
+                code = chunk_codes[i]
+                market_int = code_to_tdx_market(code)
+                
+                if api is None:
+                    api = TdxHq_API()
+                    connected = False
+                    for host, port in self.cfg.servers:
+                        try:
+                            api.connect(str(host), int(port))
+                            connected = True
+                            break
+                        except Exception:
+                            pass
+                    if not connected:
+                        api = None
+                        logger.warning("Worker failed to connect to any TDX server. Retry count: %d", retry_count)
+                        time.sleep(1)
+                        retry_count += 1
+                        if retry_count > max_retries_per_code:
+                            i += 1
+                            retry_count = 0
+                        continue
+                
+                try:
+                    info = api.get_finance_info(market_int, code)
+                    if info and "liutongguben" in info:
+                        chunk_results[code] = (float(info["liutongguben"]), None)
+                    i += 1
+                    retry_count = 0
+                except Exception as e:
+                    logger.debug("Error fetching info for %s, disconnecting: %s", code, e)
+                    try:
+                        api.disconnect()
+                    except Exception:
+                        pass
+                    api = None
+                    retry_count += 1
+                    if retry_count > max_retries_per_code:
+                        i += 1
+                        retry_count = 0
+            
+            if api is not None:
+                try:
+                    api.disconnect()
+                except Exception:
+                    pass
+            return chunk_results
+
+        shares_data = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_shares_chunk_worker, chunk): chunk for chunk in chunks}
+            for fut in as_completed(futures):
+                try:
+                    chunk_res = fut.result()
+                    shares_data.update(chunk_res)
+                except Exception as e:
+                    logger.error("Chunk worker raised exception: %s", e)
+
+        elapsed = time.time() - start_time
+        logger.info("Fetched shares for %d/%d stocks in %.2f seconds.", len(shares_data), len(df_stocks), elapsed)
+
+        if shares_data:
+            self._meta.update_stock_shares_data(shares_data)
 
     # ── 财务数据 ─────────────────────────────────────
 
@@ -502,3 +619,245 @@ class StockDB:
             result = result[result["date"] == target]
 
         return result.reset_index(drop=True)
+
+
+# ── 网络多源直连与代理绕过工具 ───────────────────────────
+
+import contextlib
+import os
+import urllib.request
+import requests
+
+@contextlib.contextmanager
+def disable_proxy():
+    """
+    临时禁用全局代理的上下文管理器，
+    通过清空代理环境变量并 Mock 相关的获取代理函数来达到彻底绕过 Clash 等全局代理的作用。
+    """
+    # 备份环境变量
+    env_keys = ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+    
+    # 清空环境变量
+    for k in env_keys:
+        if k in os.environ:
+            del os.environ[k]
+            
+    # Mock urllib 和 requests 的 getproxies
+    orig_urllib_getproxies = urllib.request.getproxies
+    orig_requests_getproxies = requests.utils.getproxies
+    orig_compat_getproxies = getattr(requests.compat, 'getproxies', None)
+    
+    urllib.request.getproxies = lambda: {}
+    requests.utils.getproxies = lambda: {}
+    if orig_compat_getproxies:
+        requests.compat.getproxies = lambda: {}
+        
+    try:
+        yield
+    finally:
+        # 恢复环境变量
+        for k, v in saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+            elif k in os.environ:
+                del os.environ[k]
+        # 恢复函数
+        urllib.request.getproxies = orig_urllib_getproxies
+        requests.utils.getproxies = orig_requests_getproxies
+        if orig_compat_getproxies:
+            requests.compat.getproxies = orig_compat_getproxies
+
+
+def fetch_daily_from_web(code: str, cutoff: str, date_str: str) -> pd.DataFrame:
+    """
+    网页多源日线瀑布流（东财 ➔ 腾讯 ➔ 新浪），不复权
+    """
+    code = normalize_code(code)
+    market = detect_market(code)
+    secid = f"1.{code}" if market == "sh" else f"0.{code}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/"
+    }
+    
+    # 1. 优先：东财 API (不复权)
+    try:
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "klt": "101",  # 日线
+            "fqt": "0",    # 不复权
+            "secid": secid,
+            "beg": cutoff,
+            "end": date_str,
+        }
+        with disable_proxy():
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            klines = data.get("data", {}).get("klines", [])
+            if klines:
+                rows = []
+                for item in klines:
+                    p = item.split(",")
+                    rows.append({
+                        "date": pd.to_datetime(p[0]),
+                        "open": float(p[1]),
+                        "close": float(p[2]),
+                        "high": float(p[3]),
+                        "low": float(p[4]),
+                        "vol": int(p[5]) * 100,  # 转换为“股”
+                        "amount": float(p[6])
+                     })
+                df = pd.DataFrame(rows)
+                df = df[(df["date"].dt.strftime("%Y%m%d") >= cutoff) & (df["date"].dt.strftime("%Y%m%d") <= date_str)]
+                if not df.empty:
+                    return df.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        logger.debug("fetch_daily_from_web: 东财失败 %s: %s", code, e)
+        
+    # 2. 备用一：腾讯 API
+    try:
+        symbol = f"{market}{code}"
+        url = f"https://web.ifzq.gtimg.cn/app/kline/kline?q={symbol}&type=day"
+        with disable_proxy():
+            resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            symbol_data = res_json.get("data", {}).get(symbol, {})
+            kdata = symbol_data.get("day", [])
+            if not kdata:
+                kdata = symbol_data.get("latest", [])
+            if kdata:
+                rows = []
+                for item in kdata:
+                    date_val = pd.to_datetime(item[0])
+                    rows.append({
+                        "date": date_val,
+                        "open": float(item[1]),
+                        "close": float(item[2]),
+                        "high": float(item[3]),
+                        "low": float(item[4]),
+                        "vol": int(float(item[5]) * 100) if market != "bj" else int(float(item[5])),
+                        "amount": float(item[6]) if len(item) > 6 else 0.0
+                    })
+                df = pd.DataFrame(rows)
+                df = df[(df["date"].dt.strftime("%Y%m%d") >= cutoff) & (df["date"].dt.strftime("%Y%m%d") <= date_str)]
+                if not df.empty:
+                    return df.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        logger.debug("fetch_daily_from_web: 腾讯失败 %s: %s", code, e)
+
+    # 3. 备用二：新浪 API
+    try:
+        symbol = f"{market}{code}"
+        url = f"https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={symbol}"
+        with disable_proxy():
+            resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            kdata = resp.json()
+            if kdata:
+                rows = []
+                for item in kdata:
+                    date_val = pd.to_datetime(item["day"])
+                    rows.append({
+                        "date": date_val,
+                        "open": float(item["open"]),
+                        "close": float(item["close"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "vol": int(float(item["volume"])),
+                        "amount": float(item.get("amount", 0.0))
+                    })
+                df = pd.DataFrame(rows)
+                df = df[(df["date"].dt.strftime("%Y%m%d") >= cutoff) & (df["date"].dt.strftime("%Y%m%d") <= date_str)]
+                if not df.empty:
+                    return df.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        logger.debug("fetch_daily_from_web: 新浪失败 %s: %s", code, e)
+        
+    return pd.DataFrame()
+
+
+def fetch_minutes_from_web(code: str, ndays: int = 5) -> pd.DataFrame:
+    """
+    网页多源分钟线瀑布流（东财 ➔ 腾讯 ➔ 新浪），不复权
+    """
+    code = normalize_code(code)
+    market = detect_market(code)
+    secid = f"1.{code}" if market == "sh" else f"0.{code}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/"
+    }
+    
+    # 1. 优先：东财 trends 接口 (包含 5 天的分钟趋势数据)
+    try:
+        url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "ndays": str(ndays),
+            "iscr": "0",
+            "secid": secid
+        }
+        with disable_proxy():
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            res_json = resp.json()
+            trends = res_json.get("data", {}).get("trends", [])
+            if trends:
+                rows = []
+                for item in trends:
+                    p = item.split(",")
+                    open_val = float(p[1])
+                    close_val = float(p[2])
+                    rows.append({
+                        "datetime": pd.to_datetime(p[0]),
+                        "open": close_val if open_val == 0.0 else open_val,
+                        "high": float(p[3]),
+                        "low": float(p[4]),
+                        "close": close_val,
+                        "vol": int(p[5]),
+                        "amount": float(p[6])
+                    })
+                df = pd.DataFrame(rows)
+                if not df.empty:
+                    return df.sort_values("datetime").reset_index(drop=True)
+    except Exception as e:
+        logger.debug("fetch_minutes_from_web: 东财失败 %s: %s", code, e)
+
+    # 2. 备用一：新浪分钟线 (akshare 包装过的)
+    try:
+        with akshare_lock:
+            import akshare as ak
+            symbol = f"{market}{code}"
+            with disable_proxy():
+                fallback_df = ak.stock_zh_a_minute(symbol=symbol, period="1", adjust="qfq")
+        if fallback_df is not None and not fallback_df.empty:
+            rename_map = {
+                "day": "datetime",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "vol",
+            }
+            df = fallback_df.rename(columns=rename_map).copy()
+            if "amount" not in df.columns:
+                df["amount"] = df["close"] * df["vol"]
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            if "open" in df.columns and "close" in df.columns:
+                df["open"] = df.apply(lambda r: r["close"] if r["open"] == 0.0 else r["open"], axis=1)
+            cols = ["datetime", "open", "high", "low", "close", "vol", "amount"]
+            return df[cols].sort_values("datetime").reset_index(drop=True)
+    except Exception as e:
+        logger.debug("fetch_minutes_from_web: 新浪失败 %s: %s", code, e)
+
+    return pd.DataFrame()

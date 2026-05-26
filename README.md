@@ -31,7 +31,7 @@ pip install -e .
 
 ### 首次初始化（全量历史日线，约 30~60 分钟）
 
-**关闭代理**后运行：
+内置代理自动绕过，直接运行：
 
 ```bash
 python3 scripts/init_full.py
@@ -71,8 +71,8 @@ db = StockDB()
 
 | 方法 | 说明 | 示例 |
 |---|---|---|
-| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet） | `db.daily('300661', start='2024-01-01')` |
-| `db.minutes(code, date, days)` | 分钟线（懒缓存，自动存盘） | `db.minutes('300661', date='20260507')` |
+| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet，成交量单位统一为“股”） | `db.daily('300661', start='2024-01-01')` |
+| `db.minutes(code, date, days)` | 分钟线（支持懒缓存与 `watchlist` 主动增量更新，防 100 天断档） | `db.minutes('300661', date='20260507')` |
 | `db.tick(code, date)` | Tick 逐笔（实时/历史缓存） | `db.tick('300661')` |
 | `db.index(code, start, end)` | 指数日线 | `db.index('000001')` |
 | `db.stock_list(market)` | 股票列表 | `db.stock_list(market='SZ')` |
@@ -89,8 +89,9 @@ db = StockDB()
 
 ```
 ① 本地 Parquet / SQLite   ← 优先，毫秒级
-② pytdx（通达信 TCP）     ← 主力网络源，无需代理
-③ akshare                 ← 备用（财务数据）
+② pytdx（通达信 TCP）     ← 主力网络源，自动绕过代理
+③ 网页 HTTP 多源瀑布流    ← 备用兜底（东财 ➔ 腾讯 ➔ 新浪），自动绕过代理
+④ akshare                 ← 备用（财务数据等，支持全局进程锁）
 ```
 
 分钟线 / Tick **首次拉取后自动缓存**，后续调用无需网络。
@@ -124,13 +125,16 @@ servers:
 stock-data/
 ├── stockdb/                # Python 包（核心）
 │   ├── __init__.py
-│   ├── reader.py           # 统一读取接口
-│   ├── updater.py          # 增量更新逻辑
+│   ├── reader.py           # 统一读取接口（内置代理绕过与并发安全锁）
+│   ├── chip.py             # 筹码分布三角计算模块
+│   ├── db.py               # SQLite 元数据库接口
+│   ├── market.py           # 市场与板块检测
 │   └── config.py           # 配置加载
 ├── scripts/
 │   ├── init_full.py        # 全量初始化（首次运行）
-│   ├── daily_update.py     # 每日增量更新（cron 调用）
-│   └── setup_cron_mac.sh   # 一键配置 Mac 定时任务
+│   ├── daily_update.py     # 每日增量更新（控制流解耦，支持主动分钟线补齐）
+│   ├── fix_daily_volume.py # 一键纠正个股成交量“手/股”单位修复脚本
+│   ├── setup_cron_mac.sh   # 一键配置 Mac 定时任务
 ├── data/
 │   ├── daily/              # 日线 Parquet（全市场，~3GB）
 │   │   ├── sh/600000.parquet
@@ -206,7 +210,7 @@ git clone <repo> /path/to/stock-data
 cd /path/to/stock-data
 bash scripts/setup_linux.sh   # 自动安装依赖、配置 cron
 ```
-然后关闭代理运行首次初始化：
+然后直接运行首次初始化：
 ```bash
 .venv/bin/python3 scripts/init_full.py
 ```
@@ -215,4 +219,31 @@ bash scripts/setup_linux.sh   # 自动安装依赖、配置 cron
 A: 有两种方案：  
 - **OneDrive/NAS 共享**：将 `data/` 目录设为共享文件夹，各机器通过符号链接访问  
 - **VPS 部署**：在服务器跑 `daily_update.py`，其他机器通过 rsync/SSH 同步 Parquet
+
+
+---
+
+## 技术维护备忘与高阶避坑经验（2026-05-23 重构记）
+
+在开发与迭代增量同步系统时，我们总结沉淀了以下极具系统健壮性价值的避坑方案：
+
+### 1. 交易日盘中数据污染（收盘安全锁）
+- **痛点**：若在交易日下午 15:30 结算完毕前运行 `daily_update.py`，会判定今天为目标日期，将盘中未收盘的临时行情追加到 Parquet 中。到盘后再次更新时，因本地最大日期已等于今天而跳过，造成当天行情永远停留在错误的未收盘阶段。
+- **方案**：引入 15:30 收盘安全锁。在 15:30 前数据上限回溯至昨天，并结合元数据库 `trade_calendar` 精准匹配上一个开市交易日，从根源规避盘中污染。
+
+### 2. Clash 全局代理网络干扰（网页 HTTP 与 TCP 二进制的分别避让）
+- **痛点**：开启科学上网/全局代理（如 Clash 代理）时，使用 `akshare` 或东方财富网页快照 HTTP 直连接口极易被拦截并报反爬错误；而 pytdx 二进制 TCP 流量被代理接管时，也会因为非标准 7709 端口转发失败而造成同步中断，致使普通股日线断更。
+- **方案**：
+  1. 将快速通道 `_bulk_update_from_spot`、akshare 兜底 `_fetch_akshare_day` 以及分钟线 trends HTTP 块用 `disable_proxy()` 包裹。通过临时清空进程代理环境变量并 Mock `urllib`/`requests` 的代理检测函数，彻底在进程内部隔绝 Clash 代理干扰。
+  2. 保证了在有全局代理的开发/生产环境下，依然拥有最坚固的高可靠网络直连直通性。
+
+### 3. 多线程并发引发的 V8 段错误崩溃 (V8 Thread-safety)
+- **痛点**：在多线程中并发导入 `akshare` 并调用基于 Javascript 的接口时，会因为 C++ 层 V8 引擎在同一进程内的多线程重复初始化冲突引发 `Check failed: !pool->IsInitialized()` 段错误崩溃退出。
+- **方案**：
+  1. 使用全局进程互斥锁 `akshare_lock` 保证导入和关键 akshare API 的独占串行。
+  2. 对分钟线更新轮询同步进行串行单线程化设计。由于使用了高效的 trends API，单线程对多股的同步速度完全能够满足秒级响应，同时彻底清除了多线程 Crash 隐患。
+
+### 4. 停牌股误报警与退市个股性能过滤
+- **停牌股处理**：如果个股长期停牌，单纯按自然日跨度计算更新相差天数（如 $\ge 100$ 天）会持续报错 `CRITICAL` 并频繁向网络发起无用查询。我们将其优化为 **“分钟线最新日期与本地日线最新日期对齐过滤”** 逻辑：若停牌期间分钟线与日线均保持在停牌前最后一天（`last_date >= last_daily_date`），说明数据已是当前最新交易状态，不做报警和无意义网络查询，完全遵循市场客观交易事实。
+- **退市股处理**：在日线增量和分钟线同步前，从 SQLite 过滤已退市股票名单并从拉取列表移除，防止为已退市股票发起成百上千次无效网络请求，实现了极佳的性能累积优化。
 

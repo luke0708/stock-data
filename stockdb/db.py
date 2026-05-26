@@ -11,14 +11,16 @@ logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stocks (
-    code        TEXT PRIMARY KEY,
-    name        TEXT,
-    market      TEXT,        -- sh / sz / bj
-    board       TEXT,        -- 主板 / 科创板 / 创业板 / 中小板 / 北交所
-    industry    TEXT,
-    list_date   TEXT,
-    delist_date TEXT,
-    updated_at  TEXT
+    code              TEXT PRIMARY KEY,
+    name              TEXT,
+    market            TEXT,        -- sh / sz / bj
+    board             TEXT,        -- 主板 / 科创板 / 创业板 / 中小板 / 北交所
+    industry          TEXT,
+    list_date         TEXT,
+    delist_date       TEXT,
+    outstanding_shares REAL,
+    free_float_shares  REAL,
+    updated_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trade_calendar (
@@ -43,6 +45,27 @@ CREATE TABLE IF NOT EXISTS update_log (
     message    TEXT,
     updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS market_chip_stats (
+    code        TEXT PRIMARY KEY,
+    name        TEXT,
+    board       TEXT,
+    close       REAL,
+    profit_ratio REAL,
+    concentration_90 REAL,
+    concentration_70 REAL,
+    avg_cost    REAL,
+    peak_price  REAL,
+    deviation   REAL,
+    shape       TEXT,
+    mtime       REAL,
+    updated_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scanner_status (
+    key         TEXT PRIMARY KEY,
+    value       TEXT
+);
 """
 
 
@@ -62,6 +85,18 @@ class MetaDB:
     def _init_schema(self):
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            # 自动迁移：检查 stocks 表是否缺少新增列
+            try:
+                cursor = conn.execute("PRAGMA table_info(stocks)")
+                columns = [row["name"] for row in cursor.fetchall()]
+                if "outstanding_shares" not in columns:
+                    conn.execute("ALTER TABLE stocks ADD COLUMN outstanding_shares REAL")
+                    logger.info("Database migration: Added outstanding_shares column to stocks table.")
+                if "free_float_shares" not in columns:
+                    conn.execute("ALTER TABLE stocks ADD COLUMN free_float_shares REAL")
+                    logger.info("Database migration: Added free_float_shares column to stocks table.")
+            except Exception as e:
+                logger.error("Database migration failed: %s", e)
 
     # ── 股票列表 ─────────────────────────────────────
 
@@ -75,11 +110,37 @@ class MetaDB:
              s.get("list_date", ""), s.get("delist_date", ""), now)
             for s in stocks
         ]
+        sql = """
+        INSERT INTO stocks (code, name, market, board, industry, list_date, delist_date, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+            name=excluded.name,
+            market=excluded.market,
+            board=excluded.board,
+            industry=excluded.industry,
+            list_date=excluded.list_date,
+            delist_date=excluded.delist_date,
+            updated_at=excluded.updated_at
+        """
+        with self._conn() as conn:
+            conn.executemany(sql, rows)
+        logger.info("Upserted %d stocks", len(rows))
+
+    def update_stock_shares_data(self, shares_dict: dict):
+        """
+        批量更新股票的流通股本和自由流通股本
+        shares_dict 结构: {code: (outstanding_shares, free_float_shares)}
+        """
+        rows = [
+            (outstanding, free_float, code)
+            for code, (outstanding, free_float) in shares_dict.items()
+        ]
         with self._conn() as conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO stocks VALUES (?,?,?,?,?,?,?,?)", rows
+                "UPDATE stocks SET outstanding_shares=?, free_float_shares=? WHERE code=?",
+                rows
             )
-        logger.info("Upserted %d stocks", len(rows))
+        logger.info("Updated shares data for %d stocks", len(rows))
 
     def get_stocks(self, market: Optional[str] = None) -> pd.DataFrame:
         sql = "SELECT * FROM stocks"
@@ -142,3 +203,106 @@ class MetaDB:
                 "INSERT OR REPLACE INTO update_log VALUES (?,?,?,?)",
                 (date_str, status, message, now)
             )
+
+    # ── 筹码分布选股与状态 ─────────────────────────────────
+
+    def get_scanner_status(self) -> dict:
+        """获取筹码扫描器进度状态"""
+        status = {
+            "is_scanning": 0,
+            "total_count": 0,
+            "scanned_count": 0,
+            "last_scan_time": "N/A",
+            "status_message": "未在运行"
+        }
+        try:
+            with self._conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, value FROM scanner_status")
+                for row in cursor.fetchall():
+                    key = row["key"]
+                    val = row["value"]
+                    if key in ["is_scanning", "total_count", "scanned_count"]:
+                        status[key] = int(val)
+                    else:
+                        status[key] = val
+        except Exception as e:
+            logger.error("Error reading scanner status: %s", e)
+        return status
+
+    def update_scanner_status(self, status_updates: dict):
+        """更新筹码扫描器运行状态"""
+        try:
+            with self._conn() as conn:
+                for k, v in status_updates.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO scanner_status (key, value) VALUES (?, ?)",
+                        (k, str(v))
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.error("Error updating scanner status: %s", e)
+
+    def upsert_market_chip_stats(self, results: List[dict]):
+        """批量更新/写入全市场个股最新筹码统计特征"""
+        with self._conn() as conn:
+            conn.executemany("""
+            INSERT OR REPLACE INTO market_chip_stats (
+                code, name, board, close, profit_ratio,
+                concentration_90, concentration_70, avg_cost,
+                peak_price, deviation, shape, mtime, updated_at
+            ) VALUES (
+                :code, :name, :board, :close, :profit_ratio,
+                :concentration_90, :concentration_70, :avg_cost,
+                :peak_price, :deviation, :shape, :mtime, datetime('now', 'localtime')
+            )
+            """, results)
+            conn.commit()
+        logger.info("Upserted %d market chip stats", len(results))
+
+    def get_market_chip_mtimes(self) -> dict:
+        """获取已缓存的股票mtime映射以实现增量更新"""
+        mtimes = {}
+        try:
+            with self._conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT code, mtime FROM market_chip_stats")
+                for code, mtime in cursor.fetchall():
+                    mtimes[code] = int(mtime) if mtime is not None else 0
+        except Exception as e:
+            logger.warning("Failed to query market_chip_stats mtimes: %s", e)
+        return mtimes
+
+    def get_industry_stock_tree(self) -> List[dict]:
+        """获取所有行业分类及其对应的个股列表，用于前端树形勾选"""
+        tree = {}
+        try:
+            with self._conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT code, name, industry, board 
+                    FROM stocks 
+                    WHERE name IS NOT NULL AND name != '' AND code IS NOT NULL
+                    ORDER BY industry, code
+                """)
+                for row in cursor.fetchall():
+                    ind = row["industry"] or "未分类"
+                    if ind not in tree:
+                        tree[ind] = []
+                    tree[ind].append({
+                        "code": row["code"],
+                        "name": row["name"],
+                        "board": row["board"]
+                    })
+        except Exception as e:
+            logger.error("Failed to get industry stock tree: %s", e)
+            
+        result = []
+        for ind, stocks in tree.items():
+            result.append({
+                "industry": ind,
+                "stocks": stocks
+            })
+        result.sort(key=lambda x: (x["industry"] == "未分类", x["industry"]))
+        return result
+

@@ -78,6 +78,10 @@ class Config:
     def index_codes(self) -> List[str]:
         return self._cfg.get("index_codes", [])
 
+    @property
+    def watchlist(self) -> List[str]:
+        return self._cfg.get("watchlist", [])
+
     # ── 路径计算 ─────────────────────────────────────
 
     def daily_path(self, code: str) -> Path:
