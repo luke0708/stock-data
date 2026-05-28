@@ -1,6 +1,7 @@
-# stockdb — A股本地行情数据库
+# stockdb — 本地行情数据库（A 股 + 美股）
 
-> 为所有本地项目提供**统一、稳定、离线可用**的 A 股数据接口。
+> 为所有本地项目提供**统一、稳定、离线可用**的行情数据接口。  
+> **A 股**与**美股**完全独立——两套模块、两套存储、互不干扰。
 
 ---
 
@@ -10,11 +11,19 @@
 所有项目永远只调用 stockdb 接口，不直接碰 akshare / pytdx / yfinance。
 ```
 
+### A 股（`StockDB`）
 - **日线**：全市场 5200 只，5 年历史，本地 Parquet，毫秒级读取
 - **分钟线**：写透缓存，首次拉取自动存盘，越用越快
 - **Tick**：当日实时，可配置保留最近 N 天历史
 - **每日自动补充**：每个交易日 16:30 后自动更新所有数据
-- **多项目共享**：`pip install -e .` 一次，所有本地项目通用
+
+### 美股（`USStockDB`）—— 与 A 股完全独立
+- **日线 + 前复权价**：yfinance 拉取，存储在 `data/daily/us/`，不影响 A 股任何文件
+- **基本面**：市值、营收同比（GAAP 季报），写入独立的 `us_*` 前缀 SQLite 表
+- **拆股 / 缩股检测**：自动记录反向拆股因子（factor < 1），配合峰值比指纹过滤稀释垃圾
+- **独立更新脚本**：`scripts/us_update.py`，与 `daily_update.py` 互不干扰
+
+**多项目共享**：`pip install -e .` 一次，所有本地项目同时可用 A 股和美股接口。
 
 ---
 
@@ -39,18 +48,17 @@ python3 scripts/init_full.py
 
 已有数据时自动跳过下载，只补充缺失部分。
 
-### 每日更新 / 周末补数
+### A 股：每日更新 / 周末补数
 
 ```bash
 source .venv/bin/activate && python3 scripts/daily_update.py
-#python3 scripts/daily_update.py
 ```
 
 - 工作日运行：补当天数据
 - 周六/周日运行：自动回溯到周五，补上周数据
 - 缺失太多时会提示 → 改跑 `init_full.py`
 
-### 数据缺失过多 / 重新初始化
+### A 股：数据缺失过多 / 重新初始化
 
 ```bash
 python3 scripts/init_full.py
@@ -58,20 +66,36 @@ python3 scripts/init_full.py
 
 下载完整 ZIP，一次性补全所有历史（无论缺失多少天）。
 
+### 美股：初始化 & 每日更新（完全独立，不影响 A 股）
+
+```bash
+# 首次初始化 / 强制重拉全量历史（5 年）
+python scripts/us_update.py --force-refresh
+
+# 每日增量更新（美东收盘后运行）
+python scripts/us_update.py
+
+# 只更新指定标的
+python scripts/us_update.py --tickers AXTI NVDA AAPL
+```
+
+美股更新脚本与 A 股 `daily_update.py` **完全隔离**：不共享代码路径、不共享存储目录、不共享 SQLite 表。两者可同时运行，互不影响。
+
 
 ---
 
 ## 接口文档
 
+### A 股 `StockDB`
+
 ```python
 from stockdb import StockDB
-
 db = StockDB()
 ```
 
 | 方法 | 说明 | 示例 |
 |---|---|---|
-| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet，成交量单位统一为“股”） | `db.daily('300661', start='2024-01-01')` |
+| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet，成交量单位统一为”股”） | `db.daily('300661', start='2024-01-01')` |
 | `db.minutes(code, date, days)` | 分钟线（支持懒缓存与 `watchlist` 主动增量更新，防 100 天断档） | `db.minutes('300661', date='20260507')` |
 | `db.tick(code, date)` | Tick 逐笔（实时/历史缓存） | `db.tick('300661')` |
 | `db.index(code, start, end)` | 指数日线 | `db.index('000001')` |
@@ -83,18 +107,44 @@ db = StockDB()
 - `market`：`'SH'` / `'SZ'` / `'BJ'` / `None`（全部）
 - `start` / `end`：日期字符串 `'YYYY-MM-DD'`，可省略
 
+### 美股 `USStockDB`（独立模块，与 A 股零耦合）
+
+```python
+from stockdb.us import USStockDB
+usdb = USStockDB()
+```
+
+| 方法 | 说明 | 示例 |
+|---|---|---|
+| `usdb.daily(ticker, start, end)` | 日线 OHLCV + 前复权价 + 成交额（美元） | `usdb.daily('AXTI', start='2024-01-01')` |
+| `usdb.splits(ticker, lookback_months)` | 拆股记录，factor < 1 = 缩股 | `usdb.splits('NIVF')` |
+| `usdb.adj_peak_ratio(ticker)` | 前复权峰值 / 现价（> 100 = 缩股垃圾指纹） | `usdb.adj_peak_ratio('NIVF')` |
+| `usdb.revenue_yoy(ticker)` | 营收同比（GAAP 季报） | `usdb.revenue_yoy('AXTI')` |
+| `usdb.market_cap(ticker)` | 当前市值（美元） | `usdb.market_cap('AXTI')` |
+| `usdb.avg_dollar_volume(ticker)` | 近 30 日均成交额（美元） | `usdb.avg_dollar_volume('AXTI')` |
+| `usdb.meta(ticker)` | 基础信息（名称、交易所、行业） | `usdb.meta('AXTI')` |
+
+> 详细说明见 [API.md](./API.md) 的「美股数据 USStockDB」章节。
+
 ---
 
 ## 数据来源优先级
 
+### A 股
 ```
 ① 本地 Parquet / SQLite   ← 优先，毫秒级
 ② pytdx（通达信 TCP）     ← 主力网络源，自动绕过代理
 ③ 网页 HTTP 多源瀑布流    ← 备用兜底（东财 ➔ 腾讯 ➔ 新浪），自动绕过代理
 ④ akshare                 ← 备用（财务数据等，支持全局进程锁）
 ```
-
 分钟线 / Tick **首次拉取后自动缓存**，后续调用无需网络。
+
+### 美股
+```
+① 本地 Parquet / SQLite   ← 优先，毫秒级
+② yfinance                ← 免费原型源（日线延迟约 15 分钟）
+```
+provider 可切换（在 `config.yaml` 的 `us.provider` 配置）：当前支持 `yfinance`，后续可扩展 `polygon` / `fmp` 等付费源。
 
 ---
 
@@ -105,16 +155,27 @@ db = StockDB()
 data_dir: ./data
 db_path: ./db/meta.db
 
-# Tick 缓存策略
+# Tick 缓存策略（A 股）
 tick:
   cache_mode: daily     # none | daily | all
   keep_days: 30         # daily 模式下保留天数
 
-# pytdx 服务器列表（自动选择最快）
+# pytdx 服务器列表（A 股，自动选择最快）
 servers:
   - ['180.153.18.170', 7709]   # 上海，推荐
   - ['119.147.212.81', 7709]   # 广东
   - ['124.74.236.50',  7709]   # 上海
+
+# 美股（独立配置块，不影响上方 A 股任何配置项）
+us:
+  enabled: true
+  provider: yfinance        # 可切换: polygon / fmp
+  history_years: 5
+  watchlist:
+    - "AXTI"                # 半导体衬底，筛选器正样本
+    - "NIVF"                # 反复缩股垃圾，筛选器反样本
+    - "AAPL"
+    - "NVDA"
 ```
 
 ---
@@ -125,30 +186,38 @@ servers:
 stock-data/
 ├── stockdb/                # Python 包（核心）
 │   ├── __init__.py
-│   ├── reader.py           # 统一读取接口（内置代理绕过与并发安全锁）
+│   ├── reader.py           # A 股统一读取接口（内置代理绕过与并发安全锁）
 │   ├── chip.py             # 筹码分布三角计算模块
-│   ├── db.py               # SQLite 元数据库接口
-│   ├── market.py           # 市场与板块检测
-│   └── config.py           # 配置加载
+│   ├── db.py               # A 股 SQLite 元数据库接口
+│   ├── market.py           # A 股市场与板块检测（6位数字代码，不影响美股）
+│   ├── config.py           # 配置加载（含 us_* 只读属性）
+│   └── us/                 # ── 美股独立子模块（与上方 A 股完全隔离）──
+│       ├── __init__.py
+│       ├── provider.py     # DataProvider ABC + YFinanceProvider（可切换数据源）
+│       ├── db.py           # USMetaDB（us_* 前缀表，同一 meta.db，不动 A 股表）
+│       ├── calendar.py     # 美股交易日历（从 ^GSPC 推导）
+│       └── reader.py       # USStockDB 门面（本地 Parquet 优先 + 写透缓存）
 ├── scripts/
-│   ├── init_full.py        # 全量初始化（首次运行）
-│   ├── daily_update.py     # 每日增量更新（控制流解耦，支持主动分钟线补齐）
-│   ├── fix_daily_volume.py # 一键纠正个股成交量“手/股”单位修复脚本
-│   ├── setup_cron_mac.sh   # 一键配置 Mac 定时任务
+│   ├── init_full.py        # A 股全量初始化（首次运行）
+│   ├── daily_update.py     # A 股每日增量更新
+│   ├── us_update.py        # 美股更新（独立，与 daily_update.py 互不干扰）
+│   ├── fix_daily_volume.py # 一键纠正个股成交量”手/股”单位修复脚本
+│   └── setup_cron_mac.sh   # 一键配置 Mac 定时任务
 ├── data/
-│   ├── daily/              # 日线 Parquet（全市场，~3GB）
-│   │   ├── sh/600000.parquet
-│   │   └── sz/300661.parquet
-│   ├── minutes/            # 分钟线（懒缓存，按需积累）
-│   │   └── sz/300661/20260507.parquet
-│   ├── index/              # 指数日线
-│   │   └── sh000001.parquet
-│   └── tick/               # Tick 缓存（最近 N 天）
-│       └── sz/300661/20260507.parquet
+│   ├── daily/
+│   │   ├── sh/600000.parquet   # A 股日线
+│   │   ├── sz/300661.parquet
+│   │   └── us/AXTI.parquet     # 美股日线（独立目录）
+│   ├── minutes/            # A 股分钟线（懒缓存，按需积累）
+│   ├── index/              # A 股指数日线
+│   └── tick/               # A 股 Tick 缓存
 ├── db/
-│   └── meta.db             # SQLite：股票列表、交易日历、财务
-├── logs/                   # 每日更新日志
-├── config.yaml             # 用户配置
+│   └── meta.db             # SQLite：A 股表（stocks/trade_calendar/...）
+│                           #        + 美股表（us_stocks/us_splits/us_financials/us_calendar）
+├── tests/
+│   └── test_us_data.py     # 美股黄金样本断言（AXTI/NIVF）
+├── logs/
+├── config.yaml
 ├── requirements.txt
 ├── setup.py
 └── README.md
@@ -170,18 +239,20 @@ stock-data/
 ## 依赖
 
 ```
-pytdx>=1.72     # 通达信 TCP 协议
-mootdx          # 读取通达信 .day 整包格式
+pytdx>=1.72     # 通达信 TCP 协议（A 股专用）
+mootdx          # 读取通达信 .day 整包格式（A 股专用）
 pandas>=2.0
 pyarrow>=14.0   # Parquet 读写
-apscheduler     # 定时任务（可选，也可用系统 cron）
 pyyaml          # 配置文件
-akshare         # 财务数据备用源
+akshare         # A 股财务数据备用源
+yfinance>=0.2.40 # 美股数据源（独立，不影响 A 股）
 ```
 
 安装：
 ```bash
-pip install pytdx mootdx pandas pyarrow apscheduler pyyaml akshare
+pip install -e .
+# 或
+pip install -r requirements.txt
 ```
 
 ---
@@ -213,6 +284,16 @@ bash scripts/setup_linux.sh   # 自动安装依赖、配置 cron
 然后直接运行首次初始化：
 ```bash
 .venv/bin/python3 scripts/init_full.py
+```
+
+**Q: 美股模块会影响 A 股数据吗？**  
+A: 不会。两者完全隔离：美股用独立子模块 `stockdb/us/`，独立存储目录 `data/daily/us/`，独立 SQLite 表（`us_` 前缀），独立更新脚本 `us_update.py`。A 股的 `market.py`、`reader.py`、`tdx_client.py`、`daily_update.py` 均未做任何修改。
+
+**Q: 美股和 A 股能同时更新吗？**  
+A: 可以，两个脚本完全独立，可并行运行：
+```bash
+python3 scripts/daily_update.py &   # A 股
+python3 scripts/us_update.py        # 美股
 ```
 
 **Q: 如何在多台机器上共享数据？**  

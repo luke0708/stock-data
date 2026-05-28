@@ -6,3 +6,4 @@ pyyaml
 akshare
 requests
 tqdm
+yfinance>=0.2.40

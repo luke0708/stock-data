@@ -14,5 +14,6 @@ setup(
         "pyyaml",
         "akshare",
         "requests",
+        "yfinance>=0.2.40",
     ],
 )

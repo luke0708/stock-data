@@ -102,6 +102,28 @@ class Config:
     def index_path(self, code: str) -> Path:
         return self.data_dir / "index" / f"{code}.parquet"
 
+    # ── 美股配置（只读，不影响 A 股任何属性）────────────
+
+    @property
+    def us_enabled(self) -> bool:
+        return bool(self._cfg.get("us", {}).get("enabled", False))
+
+    @property
+    def us_provider(self) -> str:
+        return str(self._cfg.get("us", {}).get("provider", "yfinance"))
+
+    @property
+    def us_history_years(self) -> int:
+        return int(self._cfg.get("us", {}).get("history_years", 5))
+
+    @property
+    def us_watchlist(self) -> List[str]:
+        return list(self._cfg.get("us", {}).get("watchlist", []))
+
+    def us_daily_path(self, ticker: str) -> Path:
+        """美股日线 Parquet 路径，不经过 detect_market，完全独立"""
+        return self.data_dir / "daily" / "us" / f"{ticker.upper()}.parquet"
+
     def ensure_dirs(self):
         """创建所有必要目录"""
         for sub in ("daily/sh", "daily/sz", "daily/bj",

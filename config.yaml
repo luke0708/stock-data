@@ -47,3 +47,14 @@ watchlist:
   - "300661"
   - "301348"
   - "603986"
+
+# 美股数据（独立模块，不影响 A 股配置与数据源）
+us:
+  enabled: true
+  provider: yfinance        # 可切换: polygon / fmp / eodhd
+  history_years: 5
+  watchlist:                # 小批验证样本，必须含黄金样本
+    - "AXTI"                # 正样本：小盘 pure-play 半导体衬底，应通过缩股检测
+    - "NIVF"                # 反样本：反复反向拆股垃圾，应被缩股检测标记
+    - "AAPL"                # 流动性 / 基本面健全性参照
+    - "NVDA"                # 高市值参照

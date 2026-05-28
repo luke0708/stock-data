@@ -1,7 +1,8 @@
 # stockdb API 调用文档
 
-> 本地 A 股数据库统一接口，供所有项目调用。  
-> 数据优先从本地 Parquet/SQLite 读取（毫秒级），本地缺失时自动从 pytdx 拉取并存盘。
+> 本地股票数据库统一接口，供所有项目调用。  
+> **A 股**：数据优先从本地 Parquet/SQLite 读取（毫秒级），本地缺失时自动从 pytdx 拉取并存盘。  
+> **美股**：独立模块 `USStockDB`，基于 yfinance，存储路径 `data/daily/us/`，与 A 股完全隔离。
 
 ---
 
@@ -22,6 +23,8 @@ db = StockDB()
 
 ## 接口速览
 
+### A 股（`StockDB`）
+
 | 方法 | 用途 | 返回列 |
 |---|---|---|
 | `db.daily()` | 日线 OHLCV，全市场，5年历史 | date, open, high, low, close, vol, amount |
@@ -34,6 +37,20 @@ db = StockDB()
 | `db.chip()` | 筹码分布（本地计算，按需缓存） | date, close, profit_ratio, concentration_90, concentration_70, avg_cost, peak_price |
 | `db.is_trade_day()` | 判断某天是否交易日 | bool |
 | `db.last_trade_day()` | 数据库最近交易日 | str `'YYYYMMDD'` |
+
+### 美股（`USStockDB`）
+
+| 方法 | 用途 | 返回值 |
+|---|---|---|
+| `usdb.daily()` | 日线 OHLCV + 前复权价，5年历史 | date, open, high, low, close, adj_close, vol, amount |
+| `usdb.market_cap()` | 当前市值（美元） | `float \| None` |
+| `usdb.avg_dollar_volume()` | 近N日均成交额（美元，close×vol） | `float \| None` |
+| `usdb.splits()` | 拆股记录（含缩股检测） | `[(date, factor), ...]` |
+| `usdb.adj_peak_ratio()` | 前复权历史最高价 / 当前价 | `float \| None` |
+| `usdb.revenue_yoy()` | 营收同比（GAAP 季报） | `dict \| None` |
+| `usdb.meta()` | 股票基础信息 | `dict \| None` |
+| `usdb.universe()` | 当前 watchlist | `list[str]` |
+| `usdb.sync_universe()` | 同步全部 watchlist 的 meta | — |
 
 ---
 
@@ -356,6 +373,8 @@ def get_tick_flow(code: str, date: str = None):
 
 ## 数据刷新规则
 
+### A 股
+
 | 数据类型 | 更新频率 | 触发方式 |
 |---|---|---|
 | 日线 | 每个交易日 | `python3 scripts/daily_update.py`（内置代理绕过，16:30后） |
@@ -364,6 +383,14 @@ def get_tick_flow(code: str, date: str = None):
 | 指数 | 每个交易日 | `daily_update.py` 自动更新 |
 | 股票列表 | 手动 | `python3 scripts/init_full.py` |
 | 筹码分布 | 按需（自动缓存） | `db.chip(code)` 首次自动算并缓存；日更后用 `recalc=True` 刷新 |
+
+### 美股
+
+| 数据类型 | 更新频率 | 触发方式 |
+|---|---|---|
+| 日线 + 基本面 + 拆股 | 每个交易日（美东收盘后） | `python3 scripts/us_update.py` |
+| 美股交易日历 | 随每次 us_update 自动刷新 | `us_update.py` 自动拉取 ^GSPC 更新 |
+| 全量重拉（初始化） | 按需 | `python3 scripts/us_update.py --force-refresh` |
 
 ---
 
@@ -384,6 +411,229 @@ df = db.daily('300661')
 print(f"最新数据日期: {df['date'].max().date()}")
 print(f"今天是否已更新: {str(df['date'].max().date()) == db.last_trade_day()[:4]+'-'+db.last_trade_day()[4:6]+'-'+db.last_trade_day()[6:]}")
 ```
+
+---
+
+---
+
+## 美股数据 `USStockDB`
+
+> 独立并行模块，与 A 股完全隔离：数据源(yfinance)、存储路径(`data/daily/us/`)、元数据表(`us_*` 前缀)均独立。A 股的任何接口、数据文件、数据库表均不受影响。
+
+### 快速开始
+
+```python
+from stockdb.us import USStockDB
+
+usdb = USStockDB()
+```
+
+watchlist 在 `config.yaml` 的 `us.watchlist` 里配置，默认包含黄金样本 AXTI / NIVF 和参照股 AAPL / NVDA。
+
+---
+
+### 日线数据 `usdb.daily()`
+
+```python
+# 全量历史（按 config.us_history_years，默认5年）
+df = usdb.daily('AXTI')
+
+# 指定起止日期
+df = usdb.daily('AXTI', start='2024-01-01')
+df = usdb.daily('AXTI', start='2024-01-01', end='2024-12-31')
+
+# 强制重拉（忽略本地缓存）
+df = usdb.daily('AXTI', force_refresh=True)
+
+print(df.tail())
+#          date    open    high     low   close  adj_close      vol       amount
+# 1252 2026-05-28  115.2  121.5  113.8  120.1    120.11   3812400  4.58e+08
+```
+
+**返回列说明：**
+
+| 列名 | 含义 |
+|---|---|
+| `date` | 交易日（tz-naive datetime64，已去掉美东时区） |
+| `open/high/low/close` | 不复权原始价（美元） |
+| `adj_close` | 前复权收盘价（yfinance 自动处理拆股复权） |
+| `vol` | 成交量（股） |
+| `amount` | 日成交额（`close × vol`，美元近似值） |
+
+**缓存行为：**
+- 本地 `data/daily/us/{TICKER}.parquet` 存在且未 `force_refresh` → 直接读，毫秒级
+- 本地缺失 → 拉取 `history_years` 年全量并存盘
+
+---
+
+### 拆股与缩股检测 `usdb.splits()`
+
+```python
+# 近 24 个月的拆股记录（默认）
+splits = usdb.splits('NIVF')
+# [(date(2025, 5, 5), 0.1), (date(2025, 8, 4), 0.2), ...]
+
+splits = usdb.splits('AXTI', lookback_months=24)
+# []   ← 无拆股记录
+
+# 检测是否有反向拆股（缩股）
+reverse = [(d, f) for d, f in splits if f < 1]
+if reverse:
+    print(f"⚠ 检测到 {len(reverse)} 次反向拆股: {reverse}")
+```
+
+**拆股因子约定：**
+- `factor > 1`：正向拆股（股票增多），如 2:1 拆股 → `factor=2.0`
+- `factor < 1`：反向拆股/缩股（股票减少），如 1合10 → `factor=0.1`
+
+拆股记录同时写入 `meta.db` 的 `us_splits` 表供后续筛选器使用。
+
+---
+
+### 前复权峰值比 `usdb.adj_peak_ratio()`
+
+```python
+ratio_axti = usdb.adj_peak_ratio('AXTI')   # 1.17   ← 正常，接近历史高点
+ratio_nivf = usdb.adj_peak_ratio('NIVF')   # 36117  ← 极端值，反复缩股指纹
+
+# 判断逻辑：峰值比 > 100 说明前复权历史价格远高于现价，是反复缩股的特征指纹
+if ratio_nivf and ratio_nivf > 100:
+    print("疑似反复缩股垃圾，应剔除")
+```
+
+**背景：** NIVF 历史上做了 5 次反向拆股（累计 ~12000 倍），前复权后历史最高价约 19 万，现价约 0.7，峰值比 ≈ 36000。AXTI 无缩股，峰值比约 1.2。
+
+---
+
+### 营收同比 `usdb.revenue_yoy()`
+
+```python
+rev = usdb.revenue_yoy('AXTI')
+# {
+#   'latest_q_rev': 26924000.0,   # 最新季度营收（美元）
+#   'yoy_growth': 0.391,          # 同比增速（0.391 = +39.1%）
+#   'prev_yoy_growth': 0.183,     # 上一季度同比（判断是否加速）
+#   'fetched_at': '2026-05-28T...'
+# }
+
+# 判断营收加速
+if rev and rev['yoy_growth'] and rev['prev_yoy_growth']:
+    accelerating = rev['yoy_growth'] > rev['prev_yoy_growth']
+    print(f"营收同比 {rev['yoy_growth']*100:.1f}%，加速: {accelerating}")
+```
+
+**数据源：** yfinance 季报（`quarterly_income_stmt` 的 GAAP Total Revenue），口径统一，不混用调整后口径。无季报数据时（如外国发行人 NIVF）返回 `None`。
+
+---
+
+### 市值与流动性 `usdb.market_cap()` / `usdb.avg_dollar_volume()`
+
+```python
+mc = usdb.market_cap('AXTI')         # 1.23e9   ← ~12 亿美元
+mc = usdb.market_cap('NVDA')         # 3.4e12   ← ~3.4 万亿美元
+
+# 近 30 日均成交额（美元，筛选流动性用）
+adv = usdb.avg_dollar_volume('AXTI', window_days=30)   # ~2.1e7  ← 约 2100 万美元/日
+adv = usdb.avg_dollar_volume('NIVF', window_days=30)   # ~3.8e5  ← 约 38 万美元/日（流动性极差）
+```
+
+---
+
+### 股票基础信息 `usdb.meta()`
+
+```python
+info = usdb.meta('AXTI')
+# {
+#   'name': 'AXT, Inc.',
+#   'exchange': 'NMS',
+#   'sector': 'Technology',
+#   'industry': 'Semiconductor Equipment & Materials',
+#   'shares_outstanding': 42800000,
+#   'fetched_at': '2026-05-28T...'
+# }
+```
+
+`meta()` 会将结果写入 `meta.db` 的 `us_stocks` 表，下次可通过 SQL 查询。
+
+---
+
+### Universe 与批量操作
+
+```python
+# 当前 watchlist（来自 config.yaml 的 us.watchlist）
+tickers = usdb.universe()   # ['AXTI', 'NIVF', 'AAPL', 'NVDA']
+
+# 批量拉取日线
+import pandas as pd
+dfs = {t: usdb.daily(t, start='2025-01-01') for t in tickers}
+close = pd.DataFrame({t: dfs[t].set_index('date')['close'] for t in tickers})
+print(close.tail())
+
+# 同步全部 watchlist 的 meta 到 us_stocks 表
+usdb.sync_universe()
+```
+
+---
+
+### 更新脚本 `scripts/us_update.py`
+
+```bash
+# 更新 config.yaml 里 us.watchlist 的所有标的
+python scripts/us_update.py
+
+# 指定标的
+python scripts/us_update.py --tickers AXTI NVDA AAPL
+
+# 强制重拉全量历史（首次初始化或修复数据用）
+python scripts/us_update.py --force-refresh
+
+# 查看帮助
+python scripts/us_update.py --help
+```
+
+更新内容（每次运行）：
+1. 刷新美股交易日历（从 `^GSPC` 推导）
+2. 逐 ticker：拉取日线 → 更新 `us_stocks` → 更新 `us_splits` → 更新 `us_financials`
+3. 输出每只标的的缩股检测和峰值比日志，便于人工核查
+
+---
+
+### 配置 `config.yaml`
+
+```yaml
+us:
+  enabled: true
+  provider: yfinance        # 可切换: polygon / fmp（需自行实现对应 Provider）
+  history_years: 5          # 全量历史深度（年）
+  watchlist:
+    - "AXTI"                # 正样本：半导体衬底，无缩股
+    - "NIVF"                # 反样本：反复缩股垃圾
+    - "AAPL"
+    - "NVDA"
+```
+
+---
+
+### 数据存储位置
+
+| 内容 | 路径 |
+|---|---|
+| 日线 Parquet | `data/daily/us/{TICKER}.parquet` |
+| 股票列表 | `db/meta.db` → `us_stocks` 表 |
+| 拆股记录 | `db/meta.db` → `us_splits` 表 |
+| 财务数据 | `db/meta.db` → `us_financials` 表 |
+| 交易日历 | `db/meta.db` → `us_calendar` 表 |
+
+---
+
+### 已知限制（yfinance 免费源）
+
+| 问题 | 说明 |
+|---|---|
+| 外国发行人拆股覆盖 | NIVF 等 BVI 注册公司的拆股走 6-K，yfinance 可能漏报部分历史记录（见 CLAUDE.md §3.3）；`adj_peak_ratio` 作为兜底仍可捕捉 |
+| 营收数据缺失 | 无 SEC 季报的外国发行人（如 NIVF）`revenue_yoy()` 返回 `None` |
+| 实时行情 | yfinance 日线有约 15 分钟延迟，不适合日内交易 |
+| 切换付费源 | 实现 `DataProvider` ABC 后在 `config.yaml` 将 `provider` 改为对应名称即可（`build_provider()` 函数扩展入口在 `stockdb/us/provider.py`） |
 
 ---
 
